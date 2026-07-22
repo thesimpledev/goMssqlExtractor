@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "created_at": "2026-07-22T21:00:29.858823573Z",
+  "capslock_version": "v0.3.2",
+  "goos": "linux",
+  "goarch": "amd64",
+  "gosum_sha256": "aae7c6b3506b8440947fab9ee1b64c669c8b2725977852f48183403791f17772",
+  "capabilities": {
+    "mssqlsnap": [
+      "ARBITRARY_EXECUTION",
+      "FILES",
+      "NETWORK",
+      "READ_SYSTEM_STATE",
+      "REFLECT",
+      "RUNTIME",
+      "SYSTEM_CALLS",
+      "UNANALYZED",
+      "UNSAFE_POINTER"
+    ]
+  }
+}
