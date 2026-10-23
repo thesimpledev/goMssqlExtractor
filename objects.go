@@ -22,7 +22,7 @@ func scriptSchemas(db *sql.DB, root string, counts map[string]int) error {
 	if err != nil {
 		return fmt.Errorf("reading schemas: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	for rows.Next() {
 		var name, owner string
 		if err := rows.Scan(&name, &owner); err != nil {
@@ -61,7 +61,7 @@ func scriptAliasTypes(db *sql.DB, root string, counts map[string]int) error {
 	if err != nil {
 		return fmt.Errorf("reading user-defined types: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	for rows.Next() {
 		var (
 			schema, name, baseName   string
@@ -77,7 +77,7 @@ func scriptAliasTypes(db *sql.DB, root string, counts map[string]int) error {
 		}
 		text := fmt.Sprintf("CREATE TYPE %s FROM %s %s;",
 			qualified(schema, name),
-			typeString(baseName, "", false, maxLen, precision, scale),
+			typeString(typeSpec{name: baseName, maxLen: maxLen, precision: precision, scale: scale}),
 			nullability)
 		path := filepath.Join(root, safeName(schema), "types", safeName(name)+".sql")
 		if err := writeSQLFile(path, text); err != nil {
@@ -99,7 +99,7 @@ func scriptTableTypes(db *sql.DB, root string, cat *tableCatalog, counts map[str
 	if err != nil {
 		return fmt.Errorf("reading table types: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	for rows.Next() {
 		var (
 			schema, name string
@@ -142,7 +142,7 @@ func scriptSequences(db *sql.DB, root string, counts map[string]int) error {
 	if err != nil {
 		return fmt.Errorf("reading sequences: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	for rows.Next() {
 		var (
 			schema, name             string
@@ -162,7 +162,8 @@ func scriptSequences(db *sql.DB, root string, counts map[string]int) error {
 		}
 		lines := []string{
 			"CREATE SEQUENCE " + qualified(schema, name),
-			"    AS " + typeString(typeName, typeSchema, userDefined, maxLen, precision, scale),
+			"    AS " + typeString(typeSpec{name: typeName, schema: typeSchema, userDefined: userDefined,
+				maxLen: maxLen, precision: precision, scale: scale}),
 			"    START WITH " + start,
 			"    INCREMENT BY " + increment,
 			"    MINVALUE " + minVal,

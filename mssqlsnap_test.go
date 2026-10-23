@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql/driver"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,30 +55,93 @@ func TestSplitServer(t *testing.T) {
 
 func TestTypeString(t *testing.T) {
 	cases := []struct {
-		name                     string
-		schema                   string
-		udt                      bool
-		maxLen, precision, scale int
-		want                     string
+		spec typeSpec
+		want string
 	}{
-		{"int", "sys", false, 4, 10, 0, "int"},
-		{"decimal", "sys", false, 9, 18, 2, "decimal(18,2)"},
-		{"float", "sys", false, 8, 53, 0, "float"},
-		{"float", "sys", false, 4, 24, 0, "float(24)"},
-		{"datetime2", "sys", false, 8, 27, 7, "datetime2(7)"},
-		{"varchar", "sys", false, 255, 0, 0, "varchar(255)"},
-		{"varchar", "sys", false, -1, 0, 0, "varchar(max)"},
-		{"nvarchar", "sys", false, 100, 0, 0, "nvarchar(50)"},
-		{"nvarchar", "sys", false, -1, 0, 0, "nvarchar(max)"},
-		{"binary", "sys", false, 16, 0, 0, "binary(16)"},
-		{"uniqueidentifier", "sys", false, 16, 0, 0, "uniqueidentifier"},
-		{"PhoneNumber", "dbo", true, 20, 0, 0, "[dbo].[PhoneNumber]"},
+		{typeSpec{name: "int", schema: "sys", maxLen: 4, precision: 10}, "int"},
+		{typeSpec{name: "decimal", schema: "sys", maxLen: 9, precision: 18, scale: 2}, "decimal(18,2)"},
+		{typeSpec{name: "float", schema: "sys", maxLen: 8, precision: 53}, "float"},
+		{typeSpec{name: "float", schema: "sys", maxLen: 4, precision: 24}, "float(24)"},
+		{typeSpec{name: "datetime2", schema: "sys", maxLen: 8, precision: 27, scale: 7}, "datetime2(7)"},
+		{typeSpec{name: "varchar", schema: "sys", maxLen: 255}, "varchar(255)"},
+		{typeSpec{name: "varchar", schema: "sys", maxLen: -1}, "varchar(max)"},
+		{typeSpec{name: "nvarchar", schema: "sys", maxLen: 100}, "nvarchar(50)"},
+		{typeSpec{name: "nvarchar", schema: "sys", maxLen: -1}, "nvarchar(max)"},
+		{typeSpec{name: "binary", schema: "sys", maxLen: 16}, "binary(16)"},
+		{typeSpec{name: "uniqueidentifier", schema: "sys", maxLen: 16}, "uniqueidentifier"},
+		{typeSpec{name: "PhoneNumber", schema: "dbo", userDefined: true, maxLen: 20}, "[dbo].[PhoneNumber]"},
 	}
 	for _, c := range cases {
-		got := typeString(c.name, c.schema, c.udt, c.maxLen, c.precision, c.scale)
+		got := typeString(c.spec)
 		if got != c.want {
-			t.Errorf("typeString(%s): got %q want %q", c.name, got, c.want)
+			t.Errorf("typeString(%s): got %q want %q", c.spec.name, got, c.want)
 		}
+	}
+}
+
+func TestSummaryLine(t *testing.T) {
+	inc := map[string]bool{"tables": true, "views": true, "schemas": false}
+	counts := map[string]int{"tables": 2, "views": 1, "schemas": 9}
+	if got := summaryLine("db", inc, counts); got != "db: 2 tables, 1 views" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestRequireConnFlags(t *testing.T) {
+	if err := requireConnFlags("h", "d", "u"); err != nil {
+		t.Errorf("complete flags should pass: %v", err)
+	}
+	cases := []struct{ host, db, user, want string }{
+		{"", "d", "u", "no server"},
+		{"h", "", "u", "no database"},
+		{"h", "d", "", "no user"},
+	}
+	for _, c := range cases {
+		err := requireConnFlags(c.host, c.db, c.user)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("requireConnFlags(%q,%q,%q) = %v, want %q", c.host, c.db, c.user, err, c.want)
+		}
+	}
+}
+
+func TestScriptCategories(t *testing.T) {
+	db, f := openFake(t, emptyResults())
+	inc, _, err := buildFilter("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	if err := scriptCategories(db, t.TempDir(), inc, "", counts); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range categories {
+		if counts[c] != 0 {
+			t.Errorf("%s: count %d on an empty database", c, counts[c])
+		}
+	}
+	for _, q := range []string{qSchemas, qTables, qModules, qAliasTypes, qSequences} {
+		if !f.wasQueried(q) {
+			t.Errorf("query %.30q should run when every category is enabled", q)
+		}
+	}
+}
+
+func TestScriptCategoriesSequencesOnly(t *testing.T) {
+	db, f := openFake(t, emptyResults())
+	inc, _, err := buildFilter("sequences", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scriptCategories(db, t.TempDir(), inc, "", map[string]int{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{qSchemas, qTables, qColumns, qModules, qAliasTypes} {
+		if f.wasQueried(q) {
+			t.Errorf("query %.30q should not run for a sequences-only export", q)
+		}
+	}
+	if !f.wasQueried(qSequences) {
+		t.Error("sequences query should run")
 	}
 }
 
@@ -92,6 +157,136 @@ func TestSafeName(t *testing.T) {
 	}
 	if got := safeName(".."); got != "_" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestSafeNamePathsStayUnderRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "db")
+	cases := map[string]string{
+		"../x":          ".._x",
+		`..\x`:          ".._x",
+		"/etc/passwd":   "_etc_passwd",
+		`C:\x`:          "C__x",
+		"..":            "_",
+		".":             "_",
+		"a\x00b":        "a_b",
+		"ok name":       "ok name",
+		"we/ird\\n:ame": "we_ird_n_ame",
+	}
+	for in, want := range cases {
+		if got := safeName(in); got != want {
+			t.Errorf("safeName(%q) = %q, want %q", in, got, want)
+		}
+		p := filepath.Join(root, safeName(in), "tables", safeName(in)+".sql")
+		if !strings.HasPrefix(p, root+string(filepath.Separator)) {
+			t.Errorf("path for %q escapes root: %s", in, p)
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			t.Errorf("path for %q is not under root: rel=%q err=%v", in, rel, err)
+		}
+	}
+}
+
+type errCloser struct{ closed bool }
+
+func (c *errCloser) Close() error {
+	c.closed = true
+	return errors.New("close failed")
+}
+
+func TestCloseQuietlyIgnoresError(t *testing.T) {
+	c := &errCloser{}
+	closeQuietly(c)
+	if !c.closed {
+		t.Error("Close should have been called")
+	}
+}
+
+// database/sql closes the driver rows itself once Next hits EOF and
+// reports a Close error through rows.Err(), so nothing is lost when the
+// deferred Close's own return value is discarded.
+func TestFetchTablesReportsCloseErrorThroughRowsErr(t *testing.T) {
+	db, _ := openFake(t, map[string]*fakeRows{
+		qTables: {
+			cols:     []string{"object_id", "schema", "name"},
+			data:     [][]driver.Value{{int64(1), "dbo", "T"}},
+			closeErr: errors.New("close failed"),
+		},
+	})
+	_, err := fetchTables(db)
+	if err == nil || !strings.Contains(err.Error(), "close failed") {
+		t.Errorf("close error should surface via rows.Err(): %v", err)
+	}
+}
+
+// On an early return the deferred Close runs with its error discarded,
+// and the original error is the one reported.
+func TestFetchTablesEarlyReturnKeepsOriginalError(t *testing.T) {
+	db, _ := openFake(t, map[string]*fakeRows{
+		qTables: {
+			cols:     []string{"object_id", "schema", "name"},
+			data:     [][]driver.Value{{int64(1), "dbo", nil}},
+			closeErr: errors.New("close failed"),
+		},
+	})
+	_, err := fetchTables(db)
+	if err == nil || strings.Contains(err.Error(), "close failed") {
+		t.Errorf("scan error should be reported, not the close error: %v", err)
+	}
+}
+
+func moduleRows(data ...[]driver.Value) *fakeRows {
+	return &fakeRows{
+		cols: []string{"schema", "name", "type", "definition", "encrypted"},
+		data: data,
+	}
+}
+
+func TestScriptModules(t *testing.T) {
+	root := t.TempDir()
+	db, _ := openFake(t, map[string]*fakeRows{
+		qModules: moduleRows(
+			[]driver.Value{"dbo", "P1", "P", "CREATE PROC P1 AS SELECT 1", int64(0)},
+			[]driver.Value{"dbo", "V1", "V", "CREATE VIEW V1 AS SELECT 1", int64(0)},
+			[]driver.Value{"dbo", "P2", "P", "CREATE PROC P2 AS SELECT 2", int64(1)},
+			[]driver.Value{"sales", "FN1", "FN", "CREATE FUNCTION FN1() RETURNS int AS BEGIN RETURN 1 END", int64(0)},
+		),
+	})
+	inc := map[string]bool{"procedures": true, "functions": true}
+	counts := map[string]int{}
+	if err := scriptModules(db, root, inc, counts); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(root, "dbo", "procedures", "P1.sql"))
+	if err != nil || string(b) != "CREATE PROC P1 AS SELECT 1\n" {
+		t.Errorf("P1: %q err=%v", b, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sales", "functions", "FN1.sql")); err != nil {
+		t.Error("FN1 should be written under sales/functions")
+	}
+	if _, err := os.Stat(filepath.Join(root, "dbo", "views")); !os.IsNotExist(err) {
+		t.Error("views are filtered out and must not be written")
+	}
+	if _, err := os.Stat(filepath.Join(root, "dbo", "procedures", "P2.sql")); !os.IsNotExist(err) {
+		t.Error("encrypted module must be skipped")
+	}
+	if counts["procedures"] != 1 || counts["functions"] != 1 || counts["views"] != 0 {
+		t.Errorf("counts: %v", counts)
+	}
+}
+
+func TestScriptModulesReportsMissingDefinitions(t *testing.T) {
+	db, _ := openFake(t, map[string]*fakeRows{
+		qModules: moduleRows(
+			[]driver.Value{"dbo", "P1", "P", "CREATE PROC P1 AS SELECT 1", int64(0)},
+			[]driver.Value{"dbo", "P3", "P", nil, int64(0)},
+		),
+	})
+	inc := map[string]bool{"procedures": true}
+	err := scriptModules(db, t.TempDir(), inc, map[string]int{})
+	if err == nil || !strings.Contains(err.Error(), "1 object definition(s)") || !strings.Contains(err.Error(), "[dbo].[P3]") {
+		t.Errorf("missing definition should be reported with the object name: %v", err)
 	}
 }
 
@@ -188,20 +383,23 @@ func TestWriteSQLFileNormalizes(t *testing.T) {
 	}
 }
 
+// writeStub creates a placeholder file under root and returns its path.
+func writeStub(t *testing.T, root string, parts ...string) string {
+	t.Helper()
+	p := filepath.Join(append([]string{root}, parts...)...)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func TestWipeOutputSelective(t *testing.T) {
 	root := t.TempDir()
-	mk := func(parts ...string) string {
-		p := filepath.Join(append([]string{root}, parts...)...)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-	kept := mk("dbo", "tables", "T.sql")
-	wiped := mk("dbo", "procedures", "P.sql")
+	kept := writeStub(t, root, "dbo", "tables", "T.sql")
+	wiped := writeStub(t, root, "dbo", "procedures", "P.sql")
 	inc := map[string]bool{"procedures": true}
 	if err := wipeOutput(root, inc, false); err != nil {
 		t.Fatal(err)
@@ -218,6 +416,25 @@ func TestWipeOutputSelective(t *testing.T) {
 	}
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
 		t.Error("full wipe should remove the whole subtree")
+	}
+}
+
+func TestWipeOutputSchemas(t *testing.T) {
+	root := t.TempDir()
+	schemaFile := writeStub(t, root, "schemas", "sales.sql")
+	kept := writeStub(t, root, "sales", "tables", "T.sql")
+	wiped := writeStub(t, root, "sales", "views", "V.sql")
+	if err := wipeOutput(root, map[string]bool{"schemas": true, "views": true}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(schemaFile); !os.IsNotExist(err) {
+		t.Error("schemas directory should be wiped when schemas are included")
+	}
+	if _, err := os.Stat(wiped); !os.IsNotExist(err) {
+		t.Error("views file should be wiped")
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Error("tables file should survive a schemas+views wipe")
 	}
 }
 

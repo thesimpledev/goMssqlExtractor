@@ -87,37 +87,44 @@ func loadTableCatalog(db *sql.DB, dbCollation string) (*tableCatalog, error) {
 	return cat, nil
 }
 
+// typeSpec is the sys.types / sys.columns description of a data type.
+type typeSpec struct {
+	name, schema             string
+	userDefined              bool
+	maxLen, precision, scale int
+}
+
 // typeString renders a column/parameter type the way T-SQL is written:
 // length for (n)(var)char and (var)binary, precision/scale for
 // decimal/numeric, scale for datetime2/datetimeoffset/time, and the
 // schema-qualified name for user-defined types. sys.columns stores
 // nchar/nvarchar max_length in bytes, so it is halved here.
-func typeString(name, typeSchema string, userDefined bool, maxLen, precision, scale int) string {
-	if userDefined {
-		return qualified(typeSchema, name)
+func typeString(s typeSpec) string {
+	if s.userDefined {
+		return qualified(s.schema, s.name)
 	}
-	switch name {
+	switch s.name {
 	case "decimal", "numeric":
-		return fmt.Sprintf("%s(%d,%d)", name, precision, scale)
+		return fmt.Sprintf("%s(%d,%d)", s.name, s.precision, s.scale)
 	case "float":
-		if precision == 53 {
-			return name
+		if s.precision == 53 {
+			return s.name
 		}
-		return fmt.Sprintf("float(%d)", precision)
+		return fmt.Sprintf("float(%d)", s.precision)
 	case "datetime2", "datetimeoffset", "time":
-		return fmt.Sprintf("%s(%d)", name, scale)
+		return fmt.Sprintf("%s(%d)", s.name, s.scale)
 	case "char", "varchar", "binary", "varbinary":
-		if maxLen == -1 {
-			return name + "(max)"
+		if s.maxLen == -1 {
+			return s.name + "(max)"
 		}
-		return fmt.Sprintf("%s(%d)", name, maxLen)
+		return fmt.Sprintf("%s(%d)", s.name, s.maxLen)
 	case "nchar", "nvarchar":
-		if maxLen == -1 {
-			return name + "(max)"
+		if s.maxLen == -1 {
+			return s.name + "(max)"
 		}
-		return fmt.Sprintf("%s(%d)", name, maxLen/2)
+		return fmt.Sprintf("%s(%d)", s.name, s.maxLen/2)
 	default:
-		return name
+		return s.name
 	}
 }
 
@@ -144,7 +151,7 @@ func fetchTables(db *sql.DB) ([]tableInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing tables: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	var out []tableInfo
 	for rows.Next() {
 		var t tableInfo
@@ -181,7 +188,7 @@ func fetchColumns(db *sql.DB, dbCollation string) (map[int64][]column, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading columns: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	byObj := make(map[int64][]column)
 	for rows.Next() {
 		var (
@@ -209,8 +216,9 @@ func fetchColumns(db *sql.DB, dbCollation string) (map[int64][]column, error) {
 			return nil, fmt.Errorf("reading columns: %w", err)
 		}
 		c := column{
-			name:       name,
-			typeStr:    typeString(typeName, tySchema, userDefined, maxLen, precision, scale),
+			name: name,
+			typeStr: typeString(typeSpec{name: typeName, schema: tySchema, userDefined: userDefined,
+				maxLen: maxLen, precision: precision, scale: scale}),
 			nullable:   nullable,
 			rowguid:    rowguid,
 			isComputed: isComputed,
@@ -252,7 +260,7 @@ func fetchKeyConstraints(db *sql.DB) (map[int64][]keyConstraint, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading key constraints: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	byObj := make(map[int64][]keyConstraint)
 	for rows.Next() {
 		var (
@@ -306,7 +314,7 @@ func fetchForeignKeys(db *sql.DB) (map[int64][]foreignKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading foreign keys: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	byObj := make(map[int64][]foreignKey)
 	for rows.Next() {
 		var (
@@ -353,7 +361,7 @@ func fetchCheckConstraints(db *sql.DB) (map[int64][]checkConstraint, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading check constraints: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	byObj := make(map[int64][]checkConstraint)
 	for rows.Next() {
 		var (
@@ -388,7 +396,7 @@ func fetchIndexes(db *sql.DB) (map[int64][]index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading indexes: %w", err)
 	}
-	defer rows.Close()
+	defer closeQuietly(rows)
 	byObj := make(map[int64][]index)
 	for rows.Next() {
 		var (

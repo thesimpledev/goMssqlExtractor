@@ -62,13 +62,8 @@ func run() error {
 		return err
 	}
 	host, portStr := splitServer(*server, *port)
-	switch {
-	case host == "":
-		return fmt.Errorf("no server: use -server or set MSSQL_HOST")
-	case *database == "":
-		return fmt.Errorf("no database: use -db or set MSSQL_DB")
-	case *user == "":
-		return fmt.Errorf("no user: use -user or set MSSQL_USER")
+	if err := requireConnFlags(host, *database, *user); err != nil {
+		return err
 	}
 	password, err := resolvePassword(*user, host)
 	if err != nil {
@@ -79,7 +74,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer closeQuietly(db)
 
 	var dbName, dbCollation string
 	if err := db.QueryRow(qDatabaseInfo).Scan(&dbName, &dbCollation); err != nil {
@@ -90,51 +85,84 @@ func run() error {
 	if err := wipeOutput(root, inc, full); err != nil {
 		return fmt.Errorf("cleaning %s: %w", root, err)
 	}
-
 	counts := make(map[string]int)
+	if err := scriptCategories(db, root, inc, dbCollation, counts); err != nil {
+		return err
+	}
+	if err := removeEmptyDirs(root); err != nil {
+		return err
+	}
+	fmt.Println(summaryLine(dbName, inc, counts))
+	return nil
+}
+
+func requireConnFlags(host, database, user string) error {
+	switch {
+	case host == "":
+		return fmt.Errorf("no server: use -server or set MSSQL_HOST")
+	case database == "":
+		return fmt.Errorf("no database: use -db or set MSSQL_DB")
+	case user == "":
+		return fmt.Errorf("no user: use -user or set MSSQL_USER")
+	}
+	return nil
+}
+
+// scriptCategories writes every enabled object category under root and
+// tallies the objects written per category into counts.
+func scriptCategories(db *sql.DB, root string, inc map[string]bool, dbCollation string, counts map[string]int) error {
 	if inc["schemas"] {
 		if err := scriptSchemas(db, root, counts); err != nil {
 			return err
 		}
 	}
-	var cat *tableCatalog
-	if inc["tables"] || inc["types"] {
-		if cat, err = loadTableCatalog(db, dbCollation); err != nil {
-			return err
-		}
-	}
-	if inc["tables"] {
-		if err := scriptTables(db, root, cat, counts); err != nil {
-			return err
-		}
-	}
-	if inc["views"] || inc["procedures"] || inc["functions"] || inc["triggers"] {
-		if err := scriptModules(db, root, inc, counts); err != nil {
-			return err
-		}
-	}
-	if inc["types"] {
-		if err := scriptTypes(db, root, cat, counts); err != nil {
-			return err
-		}
-	}
-	if inc["sequences"] {
-		if err := scriptSequences(db, root, counts); err != nil {
-			return err
-		}
-	}
-	if err := removeEmptyDirs(root); err != nil {
+	cat, err := catalogIfNeeded(db, inc, dbCollation)
+	if err != nil {
 		return err
 	}
+	steps := []struct {
+		on  bool
+		run func() error
+	}{
+		{inc["tables"], func() error { return scriptTables(db, root, cat, counts) }},
+		{wantsModules(inc), func() error { return scriptModules(db, root, inc, counts) }},
+		{inc["types"], func() error { return scriptTypes(db, root, cat, counts) }},
+		{inc["sequences"], func() error { return scriptSequences(db, root, counts) }},
+	}
+	for _, s := range steps {
+		if !s.on {
+			continue
+		}
+		if err := s.run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
+// catalogIfNeeded loads the table catalog only when a category that
+// needs it (tables or table types) is enabled.
+func catalogIfNeeded(db *sql.DB, inc map[string]bool, dbCollation string) (*tableCatalog, error) {
+	if !inc["tables"] && !inc["types"] {
+		return nil, nil
+	}
+	return loadTableCatalog(db, dbCollation)
+}
+
+func wantsModules(inc map[string]bool) bool {
+	return inc["views"] || inc["procedures"] || inc["functions"] || inc["triggers"]
+}
+
+// summaryLine renders the per-category object counts for the enabled
+// categories, in the order categories lists them.
+func summaryLine(dbName string, inc map[string]bool, counts map[string]int) string {
 	parts := make([]string, 0, len(categories))
 	for _, c := range categories {
 		if inc[c] {
 			parts = append(parts, fmt.Sprintf("%d %s", counts[c], c))
 		}
 	}
-	fmt.Printf("%s: %s\n", dbName, strings.Join(parts, ", "))
-	return nil
+	return dbName + ": " + strings.Join(parts, ", ")
 }
 
 // buildFilter turns the -include/-exclude flags into a category set.
@@ -155,7 +183,7 @@ func buildFilter(include, exclude string) (map[string]bool, bool, error) {
 	if exclude != "" {
 		list, on = exclude, false
 	}
-	for _, name := range strings.Split(list, ",") {
+	for name := range strings.SplitSeq(list, ",") {
 		name = strings.TrimSpace(strings.ToLower(name))
 		if name == "" {
 			continue

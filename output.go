@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -43,11 +44,20 @@ func writeSQLFile(path, content string) error {
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
+	// #nosec G301 -- output is a git tree meant to be shared; directories must be traversable by other users
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	// #nosec G306 G703 -- G306: shareable git tree. G703: every server-derived segment passes through safeName, which strips separators and dot names (see TestSafeNamePathsStayUnderRoot)
 	return os.WriteFile(path, []byte(content), 0o644)
 }
+
+// closeQuietly closes c and discards the error. For rows, database/sql
+// already closes them when Next hits EOF and reports a Close error via
+// rows.Err(), so the deferred Close only matters on early returns, where
+// the original error is the one worth reporting. For the DB handle it
+// runs on the way out of the program.
+func closeQuietly(c io.Closer) { _ = c.Close() }
 
 // wipeOutput clears the parts of the output tree this run will
 // regenerate, so objects dropped from the database disappear from the
@@ -73,13 +83,22 @@ func wipeOutput(root string, inc map[string]bool, full bool) error {
 		if !e.IsDir() || e.Name() == "schemas" {
 			continue
 		}
-		for _, c := range categories {
-			if c == "schemas" || !inc[c] {
-				continue
-			}
-			if err := os.RemoveAll(filepath.Join(root, e.Name(), c)); err != nil {
-				return err
-			}
+		if err := wipeCategoryDirs(filepath.Join(root, e.Name()), inc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// wipeCategoryDirs removes the included per-object category directories
+// under one schema directory.
+func wipeCategoryDirs(schemaDir string, inc map[string]bool) error {
+	for _, c := range categories {
+		if c == "schemas" || !inc[c] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(schemaDir, c)); err != nil {
+			return err
 		}
 	}
 	return nil
